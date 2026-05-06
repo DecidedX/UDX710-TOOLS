@@ -189,6 +189,10 @@ static void http_handler(struct mg_connection *c, int ev, void *ev_data) {
       handle_lock_cell(c, hm);
     } else if (mg_match(hm->uri, mg_str("/api/unlock_cell"), NULL)) {
       handle_unlock_cell(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/get/clock_lock"), NULL)) {
+      handle_get_clock_lock(c, hm);
+    } else if (mg_match(hm->uri, mg_str("/api/set/clock_lock"), NULL)) {
+      handle_set_clock_lock(c, hm);
     }
     /* 流量统计 API */
     else if (mg_match(hm->uri, mg_str("/api/get/Total"), NULL)) {
@@ -471,6 +475,11 @@ int http_server_start(const char *port) {
 
   /* 初始化充电控制 */
   init_charge();
+
+  /* 初始化定时锁小区 */
+  if (clock_lock_init("6677.db") != 0) {
+    printf("警告: 定时锁小区初始化失败\n");
+  }
 
   /* 初始化短信模块（必须在auth_init之前，因为auth依赖数据库） */
   if (sms_init("6677.db") != 0) {

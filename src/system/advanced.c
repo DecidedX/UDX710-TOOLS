@@ -16,6 +16,11 @@
 #include "ofono.h"
 #include "json_builder.h"
 
+pthread_mutex_t g_clock_lock_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_clock_lock_initialized = 0;
+static int timer_id = 0;
+static ClockLock g_clock_lock = {0};
+
 /* 频段映射结构 */
 typedef struct {
     const char *name;
@@ -43,7 +48,19 @@ static const BandMapping band_map[] = {
     {"N78", "5G", "TDD", 256},
     {"N79", "5G", "TDD", 512},
     {NULL, NULL, NULL, 0}
-};
+};  
+
+static void do_lock_cell(int lock, char *band, char *arfcn, char *pci);
+static int create_clock_lock_tables(void);
+static int load_clock_lock_config(void);
+
+static gboolean lock_mission(void *v);
+static gboolean unlock_mission(void *v);
+static long get_seconds_diff(int hour, int minute);
+static void set_clock_lock_timer(void);
+static ClockTime transform_from_str_time(const char *time);
+static void transform_to_str_time(char *str_time, size_t size, ClockTime time);
+static int clock_time_compare(ClockTime start, ClockTime end);
 
 /* 解析频段锁定状态 */
 static void parse_bands_info(const char *output4G, const char *output5G, int *bands) {
@@ -530,38 +547,7 @@ void handle_lock_cell(struct mg_connection *c, struct mg_http_message *hm) {
         band = "16"; /* 5G */
     }
 
-    char *result = NULL;
-    char cmd[128];
-
-    /* 1. 关闭射频 */
-    execute_at("AT+SFUN=5", &result);
-    if (result) { g_free(result); result = NULL; }
-    usleep(300000);
-
-    /* 2. 解锁4G */
-    execute_at("AT+SPFORCEFRQ=12,0", &result);
-    if (result) { g_free(result); result = NULL; }
-    usleep(300000);
-
-    /* 3. 解锁5G */
-    execute_at("AT+SPFORCEFRQ=16,0", &result);
-    if (result) { g_free(result); result = NULL; }
-    usleep(300000);
-
-    /* 4. 锁定小区 */
-    snprintf(cmd, sizeof(cmd), "AT+SPFORCEFRQ=%s,2,%s,%s", band, arfcn, pci);
-    execute_at(cmd, &result);
-    if (result) { g_free(result); result = NULL; }
-    usleep(300000);
-
-    /* 5. 打开射频 */
-    execute_at("AT+SFUN=4", &result);
-    if (result) { g_free(result); result = NULL; }
-    usleep(300000);
-
-    /* 6. 激活网络 */
-    execute_at("AT+CGACT=0,1", &result);
-    if (result) g_free(result);
+    do_lock_cell(1, band, arfcn, pci);
 
     printf("小区锁定成功\n");
     JsonBuilder *j = json_new();
@@ -581,7 +567,26 @@ void handle_unlock_cell(struct mg_connection *c, struct mg_http_message *hm) {
     HTTP_CHECK_POST(c, hm);
 
     printf("开始解锁小区...\n");
+    
+    do_lock_cell(0, NULL, NULL, NULL);
+
+    printf("小区解锁成功\n");
+    JsonBuilder *j = json_new();
+    json_obj_open(j);
+    json_add_int(j, "Code", 0);
+    json_add_str(j, "Error", "");
+    json_key_obj_open(j, "Data");
+    json_add_bool(j, "success", 1);
+    json_add_str(j, "message", "小区解锁成功");
+    json_obj_close(j);
+    json_obj_close(j);
+    HTTP_OK_FREE(c, json_finish(j));
+}
+
+/* 锁定或解锁小区 */
+static void do_lock_cell(int lock, char *band, char *arfcn, char *pci) {
     char *result = NULL;
+    char cmd[128];
 
     /* 1. 关闭射频 */
     execute_at("AT+SFUN=5", &result);
@@ -598,24 +603,312 @@ void handle_unlock_cell(struct mg_connection *c, struct mg_http_message *hm) {
     if (result) { g_free(result); result = NULL; }
     usleep(300000);
 
-    /* 4. 打开射频 */
+    if (lock) {
+        /* 4. 锁定小区 */
+        snprintf(cmd, sizeof(cmd), "AT+SPFORCEFRQ=%s,2,%s,%s", band, arfcn, pci);
+        execute_at(cmd, &result);
+        if (result) { g_free(result); result = NULL; }
+        usleep(300000);
+    }
+
+    /* 5. 打开射频 */
     execute_at("AT+SFUN=4", &result);
     if (result) { g_free(result); result = NULL; }
     usleep(300000);
 
-    /* 5. 激活网络 */
+    /* 6. 激活网络 */
     execute_at("AT+CGACT=0,1", &result);
     if (result) g_free(result);
+}
 
-    printf("小区解锁成功\n");
+/* 创建ClockLock数据表 */
+static int create_clock_lock_tables(void) {
+    const char *sql = "CREATE TABLE IF NOT EXISTS clock_lock_config ("
+                      "id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),"
+                      "enabled INTEGER DEFAULT 0,"
+                      "rat varchar(16),"
+                      "band varchar(16),"
+                      "arfcn varchar(16),"
+                      "pci varchar(16),"
+                      "start_time varchar(8),"
+                      "end_time varchar(8)"
+                      ");";
+
+                     
+    pthread_mutex_lock(&g_clock_lock_mutex);
+    int ret = db_execute(sql);
+    pthread_mutex_unlock(&g_clock_lock_mutex);
+    if (ret != 0) {
+        printf("[ClockLock] 创建配置表失败 (ret=%d)\n", ret);
+        return ret;
+    }
+
+    printf("[ClockLock] 数据库表创建/验证成功\n");
+    return 0;
+}
+
+/* 加载ClockLock配置 */
+static int load_clock_lock_config(void) {
+    char output[4096];
+    const char *sql = "SELECT enabled, rat, band, arfcn, pci, start_time, end_time "
+                      "FROM clock_lock_config WHERE id = 1;";
+
+    pthread_mutex_lock(&g_clock_lock_mutex);
+    int ret = db_query_rows(sql, "|", output, sizeof(output));
+    pthread_mutex_unlock(&g_clock_lock_mutex);
+
+    if (ret != 0 || strlen(output) == 0) {
+        memset(&g_clock_lock, 0, sizeof(g_clock_lock));
+        return 0;
+    }
+
+    char *fields[7] = {NULL};
+    int field_count = 0;
+    char *p = output;
+    char *start = p;
+
+    while (*p && field_count < 7) {
+        if (*p == '|') {
+        *p = '\0';
+        fields[field_count++] = start;
+        start = p + 1;
+        }
+        p++;
+    }
+    if (field_count < 7 && start) {
+        fields[field_count++] = start;
+    }
+
+    if (field_count >= 7) {
+        g_clock_lock.enabled = atoi(fields[0]);
+        strncpy(g_clock_lock.rat, fields[1],
+                sizeof(g_clock_lock.rat) - 1);
+        strncpy(g_clock_lock.band, fields[2],
+                sizeof(g_clock_lock.band) - 1);
+        strncpy(g_clock_lock.arfcn, fields[3],
+                sizeof(g_clock_lock.arfcn) - 1);
+        strncpy(g_clock_lock.pci, fields[4],
+                sizeof(g_clock_lock.pci) - 1);
+        g_clock_lock.start_time = transform_from_str_time(fields[5]);
+        g_clock_lock.end_time = transform_from_str_time(fields[6]);
+    }
+
+    printf("[ClockLock] 配置加载完成: 启用=%d, 开始时间=%s, 结束时间=%s,"
+            "目标小区={rat: %s, band: %s, arfcn: %s, pci: %s}\n",
+            g_clock_lock.enabled, fields[5], fields[6],
+            g_clock_lock.rat, g_clock_lock.band, g_clock_lock.arfcn, g_clock_lock.pci);
+    return 0;
+}
+
+int clock_lock_init(const char *db_path) {
+    if (g_clock_lock_initialized) {
+        return 0;
+    }
+
+    printf("[ClockLock] 初始化模块\n");
+
+    if (db_path && strlen(db_path) > 0) {
+        db_init(db_path);
+    }
+
+    if (create_clock_lock_tables() != 0) {
+        printf("[ClockLock] 创建数据库表失败\n");
+        return -1;
+    }
+
+    load_clock_lock_config();
+
+    if (g_clock_lock.enabled) {
+        set_clock_lock_timer();
+    }
+    return 0;
+}
+
+static gint64 get_seconds_diff(int hour, int minute) {
+    GDateTime *now = g_date_time_new_now_local();
+    GDateTime *target = g_date_time_new_local(
+        g_date_time_get_year(now),
+        g_date_time_get_month(now),
+        g_date_time_get_day_of_month(now),
+        hour, minute, 0.0
+    );
+    if (g_date_time_compare(target, now) <= 0) {
+        GDateTime *next_day = g_date_time_add_days(target, 1);
+        g_date_time_unref(target);
+        target = next_day;
+    }
+    gint64 diff_sec = g_date_time_difference(target, now) / (1000 * 1000);
+    
+    g_date_time_unref(now);
+    g_date_time_unref(target);
+    
+    return diff_sec;
+}
+
+static gboolean lock_mission(void *v) {
+    const char *band = "12"; /* 4G */
+    if (strstr(g_clock_lock.rat, "5G") || strstr(g_clock_lock.rat, "NR") ||
+        strstr(g_clock_lock.rat, "5g") || strstr(g_clock_lock.rat, "nr")) {
+        band = "16"; /* 5G */
+    }
+    printf("[ClockLock] 开始执行锁定\n");
+    do_lock_cell(1, band, g_clock_lock.arfcn, g_clock_lock.pci);
+    gint64 sec_diff = get_seconds_diff(g_clock_lock.end_time.hour, g_clock_lock.end_time.minute);
+    timer_id = g_timeout_add_seconds(sec_diff, unlock_mission, NULL);
+    printf("[ClockLock] 已执行锁定，设定定时解锁\n");
+    return FALSE;
+}
+
+static gboolean unlock_mission(void *v) {
+    printf("[ClockLock] 开始执行解锁\n");
+    if (timer_id != 0) {
+        do_lock_cell(0, NULL, NULL, NULL);
+        printf("[ClockLock] 已执行解锁\n");
+    }
+    gint64 sec_diff = get_seconds_diff(g_clock_lock.start_time.hour, g_clock_lock.start_time.minute);
+    timer_id = g_timeout_add_seconds(sec_diff, lock_mission, NULL);
+    printf("[ClockLock] 已设定定时锁定\n");
+    return FALSE;
+}
+
+/* 设置定时任务 */
+static void set_clock_lock_timer(void) {
+    printf("[ClockLock] 开始设定定时计划\n");
+    GDateTime *now = g_date_time_new_now_local();
+    int hour_now = g_date_time_get_hour(now);
+    int minute_now = g_date_time_get_minute(now);
+    ClockTime clock_now = {hour_now, minute_now};
+    if (clock_time_compare(g_clock_lock.start_time, g_clock_lock.end_time)) {
+        if (clock_time_compare(clock_now , g_clock_lock.start_time)) {
+            lock_mission(NULL);
+        } else {
+            unlock_mission(NULL);
+        }
+    } else {
+        if (clock_time_compare(clock_now , g_clock_lock.start_time) && clock_time_compare(g_clock_lock.end_time, clock_now)) {
+            lock_mission(NULL);
+        } else {
+            unlock_mission(NULL);
+        }
+    }
+}
+
+/* GET /api/get/clock_lock - 获取定时锁定数据 */
+void handle_get_clock_lock(struct mg_connection *c, struct mg_http_message *hm) {
+    HTTP_CHECK_GET(c, hm);
     JsonBuilder *j = json_new();
     json_obj_open(j);
     json_add_int(j, "Code", 0);
     json_add_str(j, "Error", "");
     json_key_obj_open(j, "Data");
-    json_add_bool(j, "success", 1);
-    json_add_str(j, "message", "小区解锁成功");
+    json_add_bool(j, "enabled", g_clock_lock.enabled);
+    char start_time[6] = {0}, end_time[6] = {0};
+    transform_to_str_time(start_time, 6, g_clock_lock.start_time);
+    transform_to_str_time(end_time, 6, g_clock_lock.end_time);
+    json_add_str(j, "startTime", start_time);
+    json_add_str(j, "endTime", end_time);
+    json_key_obj_open(j, "targetCell");
+    json_add_str(j, "rat", g_clock_lock.rat);
+    json_add_str(j, "band", g_clock_lock.band);
+    json_add_str(j, "arfcn", g_clock_lock.arfcn);
+    json_add_str(j, "pci", g_clock_lock.pci);
+    json_obj_close(j);
     json_obj_close(j);
     json_obj_close(j);
     HTTP_OK_FREE(c, json_finish(j));
 }
+
+/* POST /api/set/clock_lock - 设定定时锁定数据 */
+void handle_set_clock_lock(struct mg_connection *c, struct mg_http_message *hm) {
+    HTTP_CHECK_POST(c, hm);
+
+    if (timer_id != 0) {
+        g_source_remove(timer_id);
+        timer_id = 0;
+    }
+
+    int enabled = 0;
+    mg_json_get_bool(hm->body, "$.enabled", &enabled);
+
+    if (enabled) {
+        char sql[512];
+        char rat[16] = {0}, band[16] = {0}, arfcn[16] = {0}, pci[16] = {0}, start_time[8] = {0}, end_time[8] = {0};
+        char *rat_str = mg_json_get_str(hm->body, "$.targetCell.rat");
+        char *band_str = mg_json_get_str(hm->body, "$.targetCell.band");
+        char *arfcn_str = mg_json_get_str(hm->body, "$.targetCell.arfcn");
+        char *pci_str = mg_json_get_str(hm->body, "$.targetCell.pci");
+        char *start_time_str = mg_json_get_str(hm->body, "$.startTime");
+        char *end_time_str = mg_json_get_str(hm->body, "$.endTime");
+
+        if (rat_str) { strncpy(rat, rat_str, sizeof(rat) - 1); free(rat_str); }
+        if (band_str) { strncpy(band, band_str, sizeof(band) - 1); free(band_str); }
+        if (arfcn_str) { strncpy(arfcn, arfcn_str, sizeof(arfcn) - 1); free(arfcn_str); }
+        if (pci_str) { strncpy(pci, pci_str, sizeof(pci) - 1); free(pci_str); }
+        if (start_time_str) { strncpy(start_time, start_time_str, sizeof(start_time) - 1); free(start_time_str); }
+        if (end_time_str) { strncpy(end_time, end_time_str, sizeof(end_time) - 1); free(end_time_str); }
+
+        snprintf(sql, sizeof(sql),
+                "INSERT OR REPLACE INTO clock_lock_config "
+                "(id, enabled, rat, band, arfcn, pci, start_time, end_time) "
+                "VALUES (1, 1, '%s', '%s', '%s', '%s', '%s', '%s');",
+                rat, band, arfcn, pci, start_time, end_time);
+
+        pthread_mutex_lock(&g_clock_lock_mutex);
+        int ret = db_execute(sql);
+        pthread_mutex_unlock(&g_clock_lock_mutex);
+
+        if (ret == 0) {
+            load_clock_lock_config();
+            set_clock_lock_timer();
+            printf("[ClockLock] 定时锁定已保存\n");
+        }
+        JsonBuilder *j = json_new();
+        json_obj_open(j);
+        json_add_int(j, "Code", 0);
+        json_add_str(j, "Error", "");
+        json_key_obj_open(j, "Data");
+        json_add_bool(j, "success", ret == 0);
+        json_add_str(j, "message", "定时锁定已保存");
+        json_obj_close(j);
+        json_obj_close(j);
+        HTTP_OK_FREE(c, json_finish(j));
+    } else {
+        g_clock_lock.enabled = false;
+        const char *sql = "DELETE FROM clock_lock_config WHERE id=1;";
+        
+        pthread_mutex_lock(&g_clock_lock_mutex);
+        int ret = db_execute(sql);
+        pthread_mutex_unlock(&g_clock_lock_mutex);
+
+        if (ret == 0) {
+            load_clock_lock_config();
+            printf("[ClockLock] 定时锁定已停用\n");
+        }
+        JsonBuilder *j = json_new();
+        json_obj_open(j);
+        json_add_bool(j, "success", ret == 0);
+        json_add_str(j, "message", "定时锁定已停用");
+        json_obj_close(j);
+        HTTP_OK_FREE(c, json_finish(j));
+    }
+}
+
+static ClockTime transform_from_str_time(const char *time) {
+    ClockTime clock_time = {0};
+    if (time) {
+        sscanf(time, "%d:%d", &clock_time.hour, &clock_time.minute);
+    }
+    return clock_time;
+}
+
+static void transform_to_str_time(char *str_time, size_t size, ClockTime time) {
+    snprintf(str_time, size, "%02d:%02d", time.hour, time.minute);
+}
+
+static int clock_time_compare(ClockTime a, ClockTime b) {
+    if (a.hour - b.hour + a.minute - b.minute > 0) {
+        return 1;
+    }
+    return 0;
+}
+
