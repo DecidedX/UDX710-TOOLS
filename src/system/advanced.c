@@ -57,7 +57,7 @@ static int load_clock_lock_config(void);
 static gboolean lock_mission(void *v);
 static gboolean unlock_mission(void *v);
 static long get_seconds_diff(int hour, int minute);
-static void set_clock_lock_timer(void);
+static gboolean set_clock_lock_timer(void *v);
 static ClockTime transform_from_str_time(const char *time);
 static void transform_to_str_time(char *str_time, size_t size, ClockTime time);
 static int clock_time_compare(ClockTime start, ClockTime end);
@@ -719,7 +719,7 @@ int clock_lock_init(const char *db_path) {
     load_clock_lock_config();
 
     if (g_clock_lock.enabled) {
-        set_clock_lock_timer();
+        g_timeout_add_seconds(15, set_clock_lock_timer, NULL);
     }
     return 0;
 }
@@ -772,7 +772,7 @@ static gboolean unlock_mission(void *v) {
 }
 
 /* 设置定时任务 */
-static void set_clock_lock_timer(void) {
+static gboolean set_clock_lock_timer(void *v) {
     printf("[ClockLock] 开始设定定时计划\n");
     GDateTime *now = g_date_time_new_now_local();
     int hour_now = g_date_time_get_hour(now);
@@ -791,6 +791,7 @@ static void set_clock_lock_timer(void) {
             unlock_mission(NULL);
         }
     }
+    return FALSE;
 }
 
 /* GET /api/get/clock_lock - 获取定时锁定数据 */
@@ -825,6 +826,7 @@ void handle_set_clock_lock(struct mg_connection *c, struct mg_http_message *hm) 
     if (timer_id != 0) {
         g_source_remove(timer_id);
         timer_id = 0;
+        do_lock_cell(0, NULL, NULL, NULL);
     }
 
     int enabled = 0;
@@ -859,7 +861,7 @@ void handle_set_clock_lock(struct mg_connection *c, struct mg_http_message *hm) 
 
         if (ret == 0) {
             load_clock_lock_config();
-            set_clock_lock_timer();
+            set_clock_lock_timer(NULL);
             printf("[ClockLock] 定时锁定已保存\n");
         }
         JsonBuilder *j = json_new();
@@ -882,6 +884,7 @@ void handle_set_clock_lock(struct mg_connection *c, struct mg_http_message *hm) 
 
         if (ret == 0) {
             load_clock_lock_config();
+            do_lock_cell(0, NULL, NULL, NULL);
             printf("[ClockLock] 定时锁定已停用\n");
         }
         JsonBuilder *j = json_new();
@@ -906,7 +909,7 @@ static void transform_to_str_time(char *str_time, size_t size, ClockTime time) {
 }
 
 static int clock_time_compare(ClockTime a, ClockTime b) {
-    if (a.hour - b.hour + a.minute - b.minute > 0) {
+    if ((a.hour - b.hour) * 60 + a.minute - b.minute > 0) {
         return 1;
     }
     return 0;
