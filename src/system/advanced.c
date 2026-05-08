@@ -50,14 +50,24 @@ static const BandMapping band_map[] = {
     {NULL, NULL, NULL, 0}
 };  
 
+typedef struct {
+    int onPeriod;
+    gint64 duration;
+    gint64 interval;
+    ClockTime execute_time;
+    void (*function)(void);
+} ExecuteOnTimeArgs;
+
 static void do_lock_cell(int lock, char *band, char *arfcn, char *pci);
 static int create_clock_lock_tables(void);
 static int load_clock_lock_config(void);
 
-static gboolean lock_mission(void *v);
-static gboolean unlock_mission(void *v);
+static void lock_mission(void);
+static void unlock_mission(void);
+static gboolean execute_on_time(gpointer user_data);
 static long get_seconds_diff(int hour, int minute);
 static gboolean set_clock_lock_timer(void *v);
+static ClockTime get_clock_time_now(void);
 static ClockTime transform_from_str_time(const char *time);
 static void transform_to_str_time(char *str_time, size_t size, ClockTime time);
 static int clock_time_compare(ClockTime start, ClockTime end);
@@ -745,7 +755,7 @@ static gint64 get_seconds_diff(int hour, int minute) {
     return diff_sec;
 }
 
-static gboolean lock_mission(void *v) {
+static void lock_mission(void) {
     const char *band = "12"; /* 4G */
     if (strstr(g_clock_lock.rat, "5G") || strstr(g_clock_lock.rat, "NR") ||
         strstr(g_clock_lock.rat, "5g") || strstr(g_clock_lock.rat, "nr")) {
@@ -754,41 +764,68 @@ static gboolean lock_mission(void *v) {
     printf("[ClockLock] 开始执行锁定\n");
     do_lock_cell(1, band, g_clock_lock.arfcn, g_clock_lock.pci);
     gint64 sec_diff = get_seconds_diff(g_clock_lock.end_time.hour, g_clock_lock.end_time.minute);
-    timer_id = g_timeout_add_seconds(sec_diff, unlock_mission, NULL);
+    ExecuteOnTimeArgs *args = g_new(ExecuteOnTimeArgs, 1);
+    args->onPeriod = 0;
+    args->duration = 30;
+    args->interval = 60;
+    args->execute_time = g_clock_lock.end_time;
+    args->function = unlock_mission;
+    timer_id = g_timeout_add_seconds(MAX(sec_diff - 15 * 60, 1), execute_on_time, args);
     printf("[ClockLock] 已执行锁定，设定定时解锁\n");
-    return FALSE;
 }
 
-static gboolean unlock_mission(void *v) {
+static void unlock_mission(void) {
     printf("[ClockLock] 开始执行解锁\n");
     if (timer_id != 0) {
         do_lock_cell(0, NULL, NULL, NULL);
         printf("[ClockLock] 已执行解锁\n");
     }
     gint64 sec_diff = get_seconds_diff(g_clock_lock.start_time.hour, g_clock_lock.start_time.minute);
-    timer_id = g_timeout_add_seconds(sec_diff, lock_mission, NULL);
+    ExecuteOnTimeArgs *args = g_new(ExecuteOnTimeArgs, 1);
+    args->onPeriod = 0;
+    args->duration = 30;
+    args->interval = 60;
+    args->execute_time = g_clock_lock.start_time;
+    args->function = lock_mission;
+    timer_id = g_timeout_add_seconds(MAX(sec_diff - 15 * 60, 1), execute_on_time, args);
     printf("[ClockLock] 已设定定时锁定\n");
-    return FALSE;
+}
+
+static gboolean execute_on_time(gpointer user_data) {
+    ExecuteOnTimeArgs *args = (ExecuteOnTimeArgs*)user_data;
+    static gint64 count = 0;
+    if (args->onPeriod) {
+        ClockTime clock_now = get_clock_time_now();
+        if (clock_time_compare(clock_now, args->execute_time) || count == args->duration) {
+            args->function();
+            count = 0;
+            return FALSE;
+        } else {
+            count++;
+            return TRUE;
+        }
+    } else {
+        args->onPeriod = 1;
+        timer_id = g_timeout_add_seconds(args->interval, execute_on_time, args);
+        return FALSE;
+    }
 }
 
 /* 设置定时任务 */
 static gboolean set_clock_lock_timer(void *v) {
     printf("[ClockLock] 开始设定定时计划\n");
-    GDateTime *now = g_date_time_new_now_local();
-    int hour_now = g_date_time_get_hour(now);
-    int minute_now = g_date_time_get_minute(now);
-    ClockTime clock_now = {hour_now, minute_now};
+    ClockTime clock_now = get_clock_time_now();
     if (clock_time_compare(g_clock_lock.start_time, g_clock_lock.end_time)) {
         if (clock_time_compare(clock_now , g_clock_lock.start_time)) {
-            lock_mission(NULL);
+            lock_mission();
         } else {
-            unlock_mission(NULL);
+            unlock_mission();
         }
     } else {
         if (clock_time_compare(clock_now , g_clock_lock.start_time) && clock_time_compare(g_clock_lock.end_time, clock_now)) {
-            lock_mission(NULL);
+            lock_mission();
         } else {
-            unlock_mission(NULL);
+            unlock_mission();
         }
     }
     return FALSE;
@@ -896,6 +933,14 @@ void handle_set_clock_lock(struct mg_connection *c, struct mg_http_message *hm) 
     }
 }
 
+static ClockTime get_clock_time_now() {
+    ClockTime clock_time = {0, 0};
+    GDateTime *now = g_date_time_new_now_local();
+    clock_time.hour= g_date_time_get_hour(now);
+    clock_time.minute = g_date_time_get_minute(now);
+    return clock_time;
+}
+
 static ClockTime transform_from_str_time(const char *time) {
     ClockTime clock_time = {0};
     if (time) {
@@ -909,7 +954,7 @@ static void transform_to_str_time(char *str_time, size_t size, ClockTime time) {
 }
 
 static int clock_time_compare(ClockTime a, ClockTime b) {
-    if ((a.hour - b.hour) * 60 + a.minute - b.minute > 0) {
+    if ((a.hour - b.hour) * 60 + a.minute - b.minute >= 0) {
         return 1;
     }
     return 0;
