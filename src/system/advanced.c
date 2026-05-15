@@ -796,7 +796,8 @@ static gboolean execute_on_time(gpointer user_data) {
     static gint64 count = 0;
     if (args->onPeriod) {
         ClockTime clock_now = get_clock_time_now();
-        if (clock_time_compare(clock_now, args->execute_time) || count == args->duration) {
+        if ((clock_now.hour == args->execute_time.hour && clock_now.minute == args->execute_time.minute)
+            || count == args->duration) {
             args->function();
             count = 0;
             return FALSE;
@@ -954,7 +955,7 @@ static void transform_to_str_time(char *str_time, size_t size, ClockTime time) {
 }
 
 static int clock_time_compare(ClockTime a, ClockTime b) {
-    if ((a.hour - b.hour) * 60 + a.minute - b.minute >= 0) {
+    if ((a.hour - b.hour) * 60 + a.minute - b.minute > 0) {
         return 1;
     }
     return 0;
