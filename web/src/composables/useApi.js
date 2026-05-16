@@ -276,6 +276,18 @@ export async function unlockCell() {
   return request('/api/unlock_cell', { method: 'POST' })
 }
 
+// 保存定时锁小区数据
+export async function setClockLock(clockLock) {
+  return request('/api/set/clock_lock', {
+    method: 'POST',
+    body: JSON.stringify(clockLock)
+  })
+}
+
+// 获取定时锁小区数据
+export async function getClockLock() {
+  return request('/api/get/clock_lock')
+}
 
 // ==================== 充电控制API ====================
 

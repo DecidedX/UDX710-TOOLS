@@ -324,7 +324,19 @@ export default {
     recommended: 'Best',
     recommendReason: 'Best overall signal quality',
     cellList: 'Cell List',
-    current: 'Current'
+    current: 'Current',
+    setClockLockCleared: "Scheduled lock configuration cleared",
+    setClockLockSaved: "Scheduled lock configuration saved",
+    setClockLockFailed: "Failed to save scheduled lock configuration",
+    getClockLockFailed: "Failed to get scheduled lock configuration",
+    timerSetError: "Start time cannot be the same as end time",
+    timerNotSet: "Please select a time period for locking",
+    cellNotSet: "Please click on the cell list to select a cell to lock",
+    timerLock: "Scheduled Lock",
+    targetCell: "Target Cell",
+    startTime: "Start Time",
+    endTime: "End Time",
+    nextDay: "Next Day"
   },
 
   // SMS

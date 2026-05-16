@@ -323,7 +323,19 @@
     recommended: '推荐',
     recommendReason: '综合信号质量最佳',
     cellList: '小区列表',
-    current: '当前'
+    current: '当前',
+    setClockLockCleared: "定时锁定配置已清除",
+    setClockLockSaved: "定时锁定配置已保存",
+    setClockLockFailed: "保存定时锁定配置失败",
+    getClockLockFailed: "获取定时锁定配置失败",
+    timerSetError: "开始时间不能等于结束时间",
+    timerNotSet: "请选择锁定的时间段",
+    cellNotSet: "请点击小区列表选择要锁定的小区",
+    timerLock: "定时锁定",
+    targetCell: "目标小区",
+    startTime: "开始时间",
+    endTime: "结束时间",
+    nextDay: "次日",
   },
 
   // 短信管理模块

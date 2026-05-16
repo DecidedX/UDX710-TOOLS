@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { getBands, lockBands as apiLockBands, unlockBands as apiUnlockBands, getCells, lockCell as apiLockCell, unlockCell as apiUnlockCell } from '../composables/useApi'
+import { getBands, lockBands as apiLockBands, unlockBands as apiUnlockBands, getCells, lockCell as apiLockCell, unlockCell as apiUnlockCell, getClockLock, setClockLock } from '../composables/useApi'
 import { useToast } from '../composables/useToast'
 import { useConfirm } from '../composables/useConfirm'
 
@@ -15,6 +15,29 @@ const loading = ref(false)
 const lockingBands = ref(false)
 const lockingCell = ref(false)
 const refreshing = ref(false)
+const clockLockSaving = ref(false)
+
+const getDefaultClockLock = () => ({
+  enabled: false,
+  targetCell: {
+    rat: '',
+    band: '',
+    arfcn: '',
+    pci: ''
+  },
+  startTime: '',
+  endTime: ''
+})
+
+const clockLock = ref(getDefaultClockLock())
+
+const endInNextDay = computed(() => {
+  if (clockLock.value.startTime && clockLock.value.endTime){
+    let st = clockLock.value.startTime.split(':').map(Number)
+    let et = clockLock.value.endTime.split(':').map(Number)
+    return (st[0] - et[0]) * 60 + st[1] - et[1] > 0
+  }
+})
 
 // 自定义锁定相关状态
 const showCustomLock = ref(false)
@@ -74,6 +97,71 @@ const selectedBandsCount = computed(() => {
   Object.values(bands.value).forEach(group => group.forEach(band => { if (band.locked) count++ }))
   return count
 })
+
+// 定时锁小区选择
+function selectCell(cell) {
+  if (clockLockSaving.value) {
+    return
+  }
+  clockLock.value.targetCell.rat = cell.rat.toString()
+  clockLock.value.targetCell.band = cell.band.toString()
+  clockLock.value.targetCell.arfcn = cell.arfcn.toString()
+  clockLock.value.targetCell.pci = cell.pci.toString()
+}
+
+async function fetchClockLock() {
+  loading.value = true
+  try {
+    const res = await getClockLock()
+    clockLock.value = res.Code === 0 && res.Data ? res.Data : []
+  }
+  catch (err) { 
+    showError(t('advanced.getClockLockFailed') + ': ' + err.message)
+  }
+  finally { loading.value = false }
+}
+
+async function saveClockLock(clear) {
+  if (clear && !clockLock.value.enabled){
+    return
+  }
+  let temp = {
+    ...clockLock.value,
+    targetCell: { ...clockLock.value.targetCell }
+  }
+  clockLockSaving.value = true
+  if (clear) {
+    temp = getDefaultClockLock()
+  } else {
+    if (!temp.targetCell.rat) {
+      showError(t('advanced.cellNotSet'))
+      clockLockSaving.value = false
+      return
+    }
+    if (!(temp.startTime && temp.endTime)) {
+      showError(t('advanced.timerNotSet'))
+      clockLockSaving.value = false
+      return
+    }
+    if (temp.startTime === temp.endTime) {
+      showError(t('advanced.timerSetError'))
+      clockLockSaving.value = false
+      return
+    }
+    temp.enabled = true
+  }
+  try {
+    await setClockLock(temp)
+    success(t(clear ? 'advanced.setClockLockCleared' : 'advanced.setClockLockSaved'))
+    clockLock.value = temp
+    await fetchClockLock()
+    await fetchCells()
+  } catch (err) {
+    showError(t('advanced.setClockLockFailed') + ': ' + err.message)
+  } finally {
+    clockLockSaving.value = false
+  }
+}
 
 async function fetchBands() {
   loading.value = true
@@ -152,7 +240,11 @@ function getSignalColor(rsrp) {
   return 'text-red-500'
 }
 
-onMounted(() => { fetchBands(); fetchCells() })
+onMounted(() => { 
+  fetchClockLock()
+  fetchBands()
+  fetchCells()
+})
 </script>
 
 <template>
@@ -322,6 +414,7 @@ onMounted(() => { fetchBands(); fetchCells() })
         </div>
         <div class="space-y-2">
           <div v-for="(cell, index) in cells" :key="index"
+            @click="selectCell(cell)"
             class="group relative overflow-hidden flex items-center justify-between p-3 rounded-xl border transition-all"
             :class="cell.isServing 
               ? 'bg-green-50/50 dark:bg-green-500/5 border-green-400 dark:border-green-500/40' 
@@ -366,6 +459,86 @@ onMounted(() => { fetchBands(); fetchCells() })
             </button>
           </div>
         </div>
+      </div>
+
+      <!-- 定时锁定 -->
+      <div class="mt-4 pt-4">
+        <div class="flex items-center space-x-2 mb-2">
+          <div class="w-2 h-2 rounded-full bg-indigo-500"></div>
+          <span class="text-slate-700 dark:text-white/80 text-xs font-medium">{{ t('advanced.timerLock') }}</span>
+          
+          <span :class="clockLock.enabled ? 'bg-green-100 dark:bg-green-500/20 text-green-600 dark:text-green-400' : 'bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400'"
+          class="px-2 py-0.5 text-[10px] rounded-full">{{ clockLock.enabled ? t('common.enabled') : t('common.disabled') }}</span>
+          <div class="flex-1 h-px bg-slate-200 dark:bg-white/10"></div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          
+          <div class="col-span-1">
+            <label class="block text-slate-600 dark:text-white/60 text-sm mb-2">{{ t('advanced.targetCell') }}</label>
+            <div class="p-2 bg-blue-50 dark:bg-blue-500/10 rounded-xl border border-blue-200 dark:border-blue-500/30">
+              <div class="grid grid-cols-4 sm:grid-cols-4 gap-1">
+                <div class="text-center">
+                  <p class="text-slate-500 dark:text-white/50 text-[10px]">{{ t('advanced.rat') }}</p>
+                  <p class="text-slate-900 dark:text-white font-semibold text-sm">{{clockLock.targetCell.rat ? clockLock.targetCell.rat : '-'}}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-slate-500 dark:text-white/50 text-[10px]">{{ t('advanced.band') }}</p>
+                  <p class="text-purple-600 dark:text-purple-400 font-semibold text-sm">{{clockLock.targetCell.band ? clockLock.targetCell.band : '-'}}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-slate-500 dark:text-white/50 text-[10px]">{{ t('advanced.arfcn') }}</p>
+                  <p class="text-slate-900 dark:text-white font-mono text-xs">{{clockLock.targetCell.arfcn ? clockLock.targetCell.arfcn : '-'}}</p>
+                </div>
+                <div class="text-center">
+                  <p class="text-slate-500 dark:text-white/50 text-[10px]">{{ t('advanced.pci') }}</p>
+                  <p class="text-slate-900 dark:text-white font-semibold text-sm">{{clockLock.targetCell.pci ? clockLock.targetCell.pci : '-'}}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3">
+            <div>
+              <label class="block text-slate-600 dark:text-white/60 text-sm mb-2">{{ t('advanced.startTime') }}</label>
+              <input 
+                :disabled="clockLockSaving"
+                type="time" 
+                v-model="clockLock.startTime" 
+                class="w-full px-4 py-3 bg-slate-50 dark:bg-white/10 border border-slate-200 dark:border-white/20 rounded-xl text-slate-900 dark:text-white focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20 transition-all disabled:opacity-50"
+              >
+            </div>
+            <div>
+              <div class="flex items-center space-x-2">
+                <label class="block text-slate-600 dark:text-white/60 text-sm mb-2">{{ t('advanced.endTime') }}</label>
+                <span class="px-2 py-0.5 text-[10px] rounded-full bg-amber-100 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 mb-2"
+                :hidden="!endInNextDay">{{ t('advanced.nextDay') }}</span>
+              </div>
+              <input 
+                :disabled="clockLockSaving"
+                type="time" 
+                v-model="clockLock.endTime" 
+                class="w-full px-4 py-3 bg-slate-50 dark:bg-white/10 border border-slate-200 dark:border-white/20 rounded-xl text-slate-900 dark:text-white focus:border-amber-400 focus:ring-2 focus:ring-amber-400/20 transition-all disabled:opacity-50"
+              >
+            </div>
+          </div>
+          
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+          <button @click="saveClockLock(false)" :disabled="clockLockSaving"
+            class="w-full py-2.5 bg-gradient-to-r from-cyan-500 to-blue-500 text-white text-sm font-semibold rounded-lg hover:shadow-lg hover:shadow-cyan-500/30 active:scale-[0.98] transition-all duration-200 disabled:opacity-50">
+            <i class="fas fa-save mr-1.5"></i>
+            {{ t('common.save') }}
+          </button>
+          <button @click="saveClockLock(true)" :disabled="clockLockSaving || !clockLock.enabled"
+            class="w-full py-2.5 bg-gradient-to-r from-amber-500 to-red-500 text-white text-sm font-semibold rounded-lg hover:shadow-lg hover:shadow-amber-500/30 active:scale-[0.98] transition-all duration-200 disabled:opacity-50">
+            <i class="fas fa-trash mr-1.5"></i>
+            {{ t('common.clear') }}
+          </button>
+        </div>
+        
+        
       </div>
 
       <!-- 自定义锁定 -->
